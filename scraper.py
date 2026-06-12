@@ -18,8 +18,10 @@ MIN_DELAY = 1.0
 MAX_RETRIES = 3
 OUTPUT_DIR = Path("data")
 CHECKPOINT_FILE = OUTPUT_DIR / "checkpoint.json"
+IMAGES_DIR = OUTPUT_DIR / "images"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 session = requests.Session()
 session.headers.update({
@@ -126,10 +128,32 @@ def download_image(url):
         print(f"  Failed to download {url}: {e}")
         return None
 
-def save_checkpoint(records, failed_ids, completed_ids):
+def save_image_to_disk(img, lid, idx):
+    img_dir = IMAGES_DIR / str(lid)
+    img_dir.mkdir(parents=True, exist_ok=True)
+    path = img_dir / f"{idx}.jpg"
+    img.save(path, "JPEG", quality=95)
+    return str(path)
+
+def load_image_from_disk(lid, idx):
+    path = IMAGES_DIR / str(lid) / f"{idx}.jpg"
+    if path.exists():
+        return Image.open(path).convert("RGB")
+    return None
+
+def get_letter_image_count(lid):
+    img_dir = IMAGES_DIR / str(lid)
+    if img_dir.exists():
+        return len(list(img_dir.glob("*.jpg")))
+    return 0
+
+def save_checkpoint(records, failed_ids, completed_ids, images_downloaded_ids=None):
+    if images_downloaded_ids is None:
+        images_downloaded_ids = set()
     checkpoint = {
         "completed_ids": list(completed_ids),
         "failed_ids": failed_ids,
+        "images_downloaded_ids": list(images_downloaded_ids),
         "records_meta": [{k: v for k, v in r.items() if k != "images"} for r in records],
     }
     with open(CHECKPOINT_FILE, "w") as f:
@@ -149,6 +173,7 @@ def scrape_all(resume=False):
     all_records = []
     failed_ids = []
     completed_ids = set()
+    images_downloaded_ids = set()
 
     if resume:
         cp = load_checkpoint()
@@ -158,7 +183,8 @@ def scrape_all(resume=False):
                 r["images"] = []
             completed_ids = set(cp.get("completed_ids", []))
             failed_ids = cp.get("failed_ids", [])
-            print(f"  Resuming from checkpoint: {len(completed_ids)} completed, {len(failed_ids)} failed")
+            images_downloaded_ids = set(cp.get("images_downloaded_ids", []))
+            print(f"  Resuming from checkpoint: {len(completed_ids)} completed, {len(failed_ids)} failed, {len(images_downloaded_ids)} images downloaded")
 
     remaining = [lid for lid in all_ids if lid not in completed_ids]
     print(f"\nStep 2: Scraping {len(remaining)} letter pages...")
@@ -181,14 +207,14 @@ def scrape_all(resume=False):
             all_records.append(record)
             completed_ids.add(lid)
 
-            if len(completed_ids) % 100 == 0:
-                save_checkpoint(all_records, failed_ids, completed_ids)
+            if len(completed_ids) % 10 == 0:
+                save_checkpoint(all_records, failed_ids, completed_ids, images_downloaded_ids)
 
         except Exception as e:
             print(f"\n  Failed to scrape ID {lid}: {e}")
             failed_ids.append(lid)
 
-    save_checkpoint(all_records, failed_ids, completed_ids)
+    save_checkpoint(all_records, failed_ids, completed_ids, images_downloaded_ids)
 
     print(f"\n  Successfully scraped: {len(all_records)}")
     print(f"  Failed: {len(failed_ids)}")
@@ -196,13 +222,32 @@ def scrape_all(resume=False):
         print(f"  Failed IDs: {failed_ids}")
 
     print(f"\nStep 3: Downloading images for {len(all_records)} letters...")
-    for record in tqdm(all_records):
-        images = []
-        for url in record["image_urls"]:
-            img = download_image(url)
-            if img is not None:
-                images.append(img)
-        record["images"] = images
+    for idx, record in enumerate(tqdm(all_records)):
+        lid = record["id"]
+        n_expected = record["image_count"]
+
+        if lid in images_downloaded_ids and get_letter_image_count(lid) >= n_expected:
+            images = []
+            for i in range(n_expected):
+                img = load_image_from_disk(lid, i)
+                if img is not None:
+                    images.append(img)
+            record["images"] = images
+        else:
+            images = []
+            for i, url in enumerate(record["image_urls"]):
+                img = download_image(url)
+                if img is not None:
+                    save_image_to_disk(img, lid, i)
+                    images.append(img)
+            record["images"] = images
+            if len(images) == n_expected:
+                images_downloaded_ids.add(lid)
+
+        if (idx + 1) % 10 == 0:
+            save_checkpoint(all_records, failed_ids, completed_ids, images_downloaded_ids)
+
+    save_checkpoint(all_records, failed_ids, completed_ids, images_downloaded_ids)
 
     return all_records
 
