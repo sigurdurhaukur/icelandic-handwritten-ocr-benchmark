@@ -225,23 +225,15 @@ def scrape_all(resume=False):
     for idx, record in enumerate(tqdm(all_records)):
         lid = record["id"]
         n_expected = record["image_count"]
+        record["images"] = []
 
-        if lid in images_downloaded_ids and get_letter_image_count(lid) >= n_expected:
-            images = []
-            for i in range(n_expected):
-                img = load_image_from_disk(lid, i)
-                if img is not None:
-                    images.append(img)
-            record["images"] = images
-        else:
-            images = []
+        if lid not in images_downloaded_ids or get_letter_image_count(lid) < n_expected:
             for i, url in enumerate(record["image_urls"]):
                 img = download_image(url)
                 if img is not None:
                     save_image_to_disk(img, lid, i)
-                    images.append(img)
-            record["images"] = images
-            if len(images) == n_expected:
+                    img.close()
+            if get_letter_image_count(lid) == n_expected:
                 images_downloaded_ids.add(lid)
 
         if (idx + 1) % 10 == 0:
@@ -315,7 +307,7 @@ def build_dataset(records):
             "writer_origin_county": [r.get("writer_origin_county", "") for r in recs],
             "text_plain": [r["text_plain"] for r in recs],
             "text_html": [r["text_html"] for r in recs],
-            "images": [r["images"] for r in recs],
+            "images": [[load_image_from_disk(r["id"], i) for i in range(r["image_count"])] for r in recs],
             "image_urls": [r["image_urls"] for r in recs],
         }
 
