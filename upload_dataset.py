@@ -12,7 +12,6 @@ Improvements over v1:
 
 import json
 import logging
-import shutil
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,7 +19,6 @@ from pathlib import Path
 
 from datasets import Dataset, Features, Sequence, Value
 from datasets import Image as HFImage
-from huggingface_hub import HfApi
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
@@ -34,7 +32,6 @@ log = logging.getLogger(__name__)
 OUTPUT_DIR = Path("data")
 IMAGES_DIR = OUTPUT_DIR / "images"
 RECORDS_PATH = OUTPUT_DIR / "scraped_records.json"
-PARQUET_DIR = OUTPUT_DIR / "parquet_shards"
 CHECKPOINT_PATH = OUTPUT_DIR / "upload_checkpoint.json"
 REPO_ID = "Sigurdur/19th-century-icelandic-letters"
 
@@ -312,27 +309,21 @@ https://brefasafn.arnastofnun.is/
 def main():
     import argparse
 
+    from datasets import DatasetDict
+
     parser = argparse.ArgumentParser(
         description="Build and upload the letters dataset."
     )
     parser.add_argument(
-        "--from-parquet",
-        action="store_true",
-        help="Skip build phase; upload existing parquet shards",
-    )
-    parser.add_argument(
         "--max-shard-size",
         default="500MB",
-        help="HF Dataset shard size (default: 500MB)",
+        help="Parquet shard size passed to push_to_hub (default: 500MB)",
     )
     parser.add_argument(
         "--image-workers",
         type=int,
         default=8,
         help="Threads for parallel image loading per record (default: 8)",
-    )
-    parser.add_argument(
-        "--num-workers", type=int, default=4, help="Upload worker threads (default: 4)"
     )
     parser.add_argument(
         "--reset-checkpoint",
@@ -342,136 +333,105 @@ def main():
     parser.add_argument(
         "--debug", action="store_true", help="Use only 10 records per split"
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Cap total records across all splits (e.g. --max-samples 10)",
+    )
     args = parser.parse_args()
 
-    if args.from_parquet:
-        if not PARQUET_DIR.exists():
-            log.error("%s does not exist", PARQUET_DIR)
-            raise SystemExit(1)
-        log.info("Skipping build — uploading %s/", PARQUET_DIR)
-    else:
-        log.info("Loading records from %s", RECORDS_PATH)
-        records: list[dict] = json.loads(RECORDS_PATH.read_text())
-        log.info("  %d records loaded", len(records))
+    log.info("Loading records from %s", RECORDS_PATH)
+    records: list[dict] = json.loads(RECORDS_PATH.read_text())
+    log.info("  %d records loaded", len(records))
 
-        train_recs, val_recs, test_recs = split_records(records)
-        if args.debug:
-            train_recs, val_recs, test_recs = (
-                train_recs[:10],
-                val_recs[:10],
-                test_recs[:10],
-            )
+    train_recs, val_recs, test_recs = split_records(records)
 
-        for name, recs in [
-            ("train", train_recs),
-            ("val", val_recs),
-            ("test", test_recs),
-        ]:
-            log.info(
-                "  %-6s %4d records / %4d images", name, len(recs), count_images(recs)
-            )
-
-        features = make_features()
-
-        completed = set() if args.reset_checkpoint else load_checkpoint()
-
-        if not PARQUET_DIR.exists():
-            PARQUET_DIR.mkdir(parents=True)
-
-        readme = PARQUET_DIR / "README.md"
-        readme.write_text(DATASET_CARD)
-        log.info("Wrote dataset card")
-
-        phases = [
-            ("train", train_recs),
-            ("validation", val_recs),
-            ("test", test_recs),
-        ]
-
-        total_records = sum(len(r) for _, r in phases)
-        total_images = sum(count_images(r) for _, r in phases)
-
-        with tqdm(
-            total=total_records,
-            desc="records",
-            unit="rec",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} rec  "
-            "[{elapsed}<{remaining}, {rate_fmt}]",
-        ) as pbar:
-            for split_name, recs in phases:
-                if split_name in completed:
-                    pbar.write(f"  Skipping {split_name} (already done)")
-                    pbar.update(len(recs))
-                    continue
-
-                split_dir = PARQUET_DIR / split_name
-                if split_dir.exists():
-                    shutil.rmtree(split_dir)
-                split_dir.mkdir(parents=True)
-
-                pbar.set_postfix(split=split_name, imgs=count_images(recs))
-                pbar.write(
-                    f"\n[{split_name}] {len(recs)} records / "
-                    f"{count_images(recs)} images"
-                )
-
-                try:
-                    ds = Dataset.from_generator(
-                        record_generator,
-                        features=features,
-                        gen_kwargs={
-                            "records": recs,
-                            "image_workers": args.image_workers,
-                            "pbar": pbar,
-                        },
-                        num_proc=1,
-                    )
-                    ds.save_to_disk(str(split_dir), max_shard_size=args.max_shard_size)
-                    del ds
-
-                    n_shards = len(list(split_dir.rglob("*.arrow")))
-                    total_mb = (
-                        sum(
-                            f.stat().st_size
-                            for f in split_dir.rglob("*")
-                            if f.is_file()
-                        )
-                        / 1e6
-                    )
-                    pbar.write(
-                        f"  → {split_name}: {n_shards} shards, {total_mb:.0f} MB"
-                    )
-
-                    completed.add(split_name)
-                    save_checkpoint(completed)
-
-                except Exception:
-                    log.exception(
-                        "Failed on split '%s' — checkpoint saved for completed splits",
-                        split_name,
-                    )
-                    raise
-
-        total_gb = (
-            sum(f.stat().st_size for f in PARQUET_DIR.rglob("*") if f.is_file()) / 1e9
+    if args.debug:
+        train_recs, val_recs, test_recs = train_recs[:10], val_recs[:10], test_recs[:10]
+    if args.max_samples is not None:
+        n = args.max_samples
+        train_recs = train_recs[: max(1, round(n * 0.8))]
+        val_recs = val_recs[: max(1, round(n * 0.1))]
+        test_recs = test_recs[: max(1, round(n * 0.1))]
+        log.info(
+            "Capped to ~%d samples (--max-samples %d)",
+            len(train_recs) + len(val_recs) + len(test_recs),
+            n,
         )
-        log.info("Total on disk: %.2f GB", total_gb)
 
-    log.info("Uploading %s/ to %s ...", PARQUET_DIR, REPO_ID)
-    log.info("  Tip: export HF_XET_HIGH_PERFORMANCE=1 before running for max speed")
+    for name, recs in [("train", train_recs), ("val", val_recs), ("test", test_recs)]:
+        log.info("  %-6s %4d records / %4d images", name, len(recs), count_images(recs))
 
-    api = HfApi()
-    api.upload_large_folder(
-        folder_path=str(PARQUET_DIR),
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        num_workers=args.num_workers,
-    )
+    features = make_features()
+    completed = set() if args.reset_checkpoint else load_checkpoint()
 
-    # Clean up checkpoint on successful completion
+    phases = [
+        ("train", train_recs),
+        ("validation", val_recs),
+        ("test", test_recs),
+    ]
+    total_records = sum(len(r) for _, r in phases)
+
+    dataset_dict: dict = {}
+
+    with tqdm(
+        total=total_records,
+        desc="records",
+        unit="rec",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} rec  "
+        "[{elapsed}<{remaining}, {rate_fmt}]",
+    ) as pbar:
+        for split_name, recs in phases:
+            if split_name in completed:
+                pbar.write(f"  Skipping {split_name} (already built)")
+                pbar.update(len(recs))
+                continue
+
+            pbar.set_postfix(split=split_name, imgs=count_images(recs))
+            pbar.write(
+                f"\n[{split_name}] {len(recs)} records / {count_images(recs)} images"
+            )
+
+            try:
+                ds = Dataset.from_generator(
+                    record_generator,
+                    features=features,
+                    gen_kwargs={
+                        "records": recs,
+                        "image_workers": args.image_workers,
+                        "pbar": pbar,
+                    },
+                    num_proc=1,
+                    # Each batch is serialised to Arrow before the next is
+                    # accumulated. Images are large; 10 records per batch
+                    # keeps each batch well under PyArrow's 2 GB int32
+                    # offset limit that causes 'offset overflow' errors.
+                    writer_batch_size=10,
+                )
+                dataset_dict[split_name] = ds
+                completed.add(split_name)
+                save_checkpoint(completed)
+
+            except Exception:
+                log.exception(
+                    "Failed on split '%s' — checkpoint saved for completed splits",
+                    split_name,
+                )
+                raise
+
+    if not dataset_dict:
+        log.info("Nothing to upload (all splits already completed).")
+        return
+
+    dsd = DatasetDict(dataset_dict)
+    log.info("Uploading to %s ...", REPO_ID)
+    # push_to_hub writes sharded Parquet (not Arrow), which the HF dataset
+    # viewer can read. max_shard_size controls shard file size.
+    dsd.push_to_hub(REPO_ID, max_shard_size=args.max_shard_size)
+
     if CHECKPOINT_PATH.exists():
         CHECKPOINT_PATH.unlink()
-
     log.info("Done!")
 
 
